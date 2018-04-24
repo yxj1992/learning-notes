@@ -1,0 +1,302 @@
+### 深入理解Ribbon
+#### Ribbon的使用脉络
+```
+/**
+ * Annotation to mark a RestTemplate bean to be configured to use a LoadBalancerClient
+ * @author Spencer Gibb
+ */
+@Target({ ElementType.FIELD, ElementType.PARAMETER, ElementType.METHOD })
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Inherited
+@Qualifier
+public @interface LoadBalanced {
+}
+```
+从@LoadBalanced注解源码的注释中，我们可以知道该注解用来给RestTemplate标记，以使用负载均衡的客户端（LoadBalancerClient）来配置它。
+
+通过搜索LoadBalancerClient，我们可以发现这是Spring Cloud中定义的一个接口：
+```
+public interface LoadBalancerClient {
+
+    ServiceInstance choose(String serviceId);
+
+    <T> T execute(String serviceId, LoadBalancerRequest<T> request) throws IOException;
+
+    URI reconstructURI(ServiceInstance instance, URI original);
+
+}
+```
+从该接口中，我们可以通过定义的抽象方法来了解到客户端负载均衡器中应具备的几种能力：
+- ServiceInstance choose(String serviceId)：根据传入的服务名serviceId，从负载均衡器中挑选一个对应服务的实例。
+- T execute(String serviceId, LoadBalancerRequest request) throws IOException：使用从负载均衡器中挑选出的服务实例来执行请求内容。
+- URI reconstructURI(ServiceInstance instance, URI original)：为系统构建一个合适的“host:port”形式的URI。在分布式系统中，我们使用逻辑上的服务名称作为host来构建URI（替代服务实例的“host:port”形式）进行请求，比如：http://myservice/path/to/service 在该操作的定义中，前者ServiceInstance对象是带有host和port的具体服务实例，而后者URI对象则是使用逻辑服务名定义为host的URI，而返回的URI内容则是通过ServiceInstance的服务实例详情拼接出的具体“host:post”形式的请求地址。
+
+从LoadBalancerAutoConfiguration类头上的注解可以知道Ribbon实现的负载均衡自动化配置需要满足下面两个条件：
+- @ConditionalOnClass(RestTemplate.class)：RestTemplate类必须存在于当前工程的环境中。
+- @ConditionalOnBean(LoadBalancerClient.class)：在Spring的Bean工程中有必须有LoadBalancerClient的实现Bean。
+
+在该自动化配置类中，主要做了下面三件事：
+```
+- 创建了一个LoadBalancerInterceptor的Bean，用于实现对客户端发起请求时进行拦截，以实现客户端负载均衡。
+- 创建了一个RestTemplateCustomizer的Bean，用于给RestTemplate增加LoadBalancerInterceptor拦截器。
+- 维护了一个被@LoadBalanced注解修饰的RestTemplate对象列表，并在这里进行初始化，通过调用RestTemplateCustomizer的实例来给需要客户端负载均衡的RestTemplate增加LoadBalancerInterceptor拦截器。
+```
+
+接下来，我们看看LoadBalancerInterceptor拦截器是如何将一个普通的RestTemplate变成客户端负载均衡的：
+```
+public class LoadBalancerInterceptor implements ClientHttpRequestInterceptor {
+
+    private LoadBalancerClient loadBalancer;
+
+    public LoadBalancerInterceptor(LoadBalancerClient loadBalancer) {
+        this.loadBalancer = loadBalancer;
+    }
+
+    @Override
+    public ClientHttpResponse intercept(final HttpRequest request, final byte[] body,
+            final ClientHttpRequestExecution execution) throws IOException {
+        final URI originalUri = request.getURI();
+        String serviceName = originalUri.getHost();
+        return this.loadBalancer.execute(serviceName,
+                new LoadBalancerRequest<ClientHttpResponse>() {
+                    @Override
+                    public ClientHttpResponse apply(final ServiceInstance instance)
+                            throws Exception {
+                        HttpRequest serviceRequest = new ServiceRequestWrapper(request,
+                                instance);
+                        return execution.execute(serviceRequest, body);
+                    }
+                });
+    }
+
+    private class ServiceRequestWrapper extends HttpRequestWrapper {
+
+        private final ServiceInstance instance;
+
+        public ServiceRequestWrapper(HttpRequest request, ServiceInstance instance) {
+            super(request);
+            this.instance = instance;
+        }
+
+        @Override
+        public URI getURI() {
+            URI uri = LoadBalancerInterceptor.this.loadBalancer.reconstructURI(
+                    this.instance, getRequest().getURI());
+            return uri;
+        }
+    }
+}
+```
+当一个被@LoadBalanced注解修饰的RestTemplate对象向外发起HTTP请求时，会被LoadBalancerInterceptor类的intercept函数所拦截。由于我们在使用RestTemplate时候采用了服务名作为host，所以直接从HttpRequest的URI对象中通过getHost()就可以拿到服务名，然后调用execute函数去根据服务名来选择实例并发起实际的请求。
+
+RibbonLoadBalancerClient是LoadBalancerClient接口的具体实现类：
+```
+public <T> T execute(String serviceId, LoadBalancerRequest<T> request) throws IOException {
+    ILoadBalancer loadBalancer = getLoadBalancer(serviceId);
+    Server server = getServer(loadBalancer);
+    if (server == null) {
+        throw new IllegalStateException("No instances available for " + serviceId);
+    }
+    RibbonServer ribbonServer = new RibbonServer(serviceId, server, isSecure(server,
+            serviceId), serverIntrospector(serviceId).getMetadata(server));
+
+    RibbonLoadBalancerContext context = this.clientFactory
+            .getLoadBalancerContext(serviceId);
+    RibbonStatsRecorder statsRecorder = new RibbonStatsRecorder(context, server);
+
+    try {
+        T returnVal = request.apply(ribbonServer);
+        statsRecorder.recordStats(returnVal);
+        return returnVal;
+    }
+    catch (IOException ex) {
+        statsRecorder.recordStats(ex);
+        throw ex;
+    }
+    catch (Exception ex) {
+        statsRecorder.recordStats(ex);
+        ReflectionUtils.rethrowRuntimeException(ex);
+    }
+    return null;
+}
+```
+可以看到，在execute函数的实现中，第一步做的就是通过getServer根据传入的服务名serviceId去获得具体的服务实例：
+```
+protected Server getServer(ILoadBalancer loadBalancer) {
+    if (loadBalancer == null) {
+        return null;
+    }
+    return loadBalancer.chooseServer("default");
+}
+```
+通过getServer函数的实现源码，我们可以看到这里获取具体服务实例的时候并没有使用LoadBalancerClient接口中的choose函数，而是使用了ribbon自身的ILoadBalancer接口中定义的chooseServer函数。
+```
+public interface ILoadBalancer {
+
+    public void addServers(List<Server> newServers);
+
+    public Server chooseServer(Object key);
+
+    public void markServerDown(Server server);
+
+    public List<Server> getReachableServers();
+
+    public List<Server> getAllServers();
+}
+```
+- addServers：向负载均衡器中维护的实例列表增加服务实例。
+- chooseServer：通过某种策略，从负载均衡器中挑选出一个具体的服务实例。
+- markServerDown：用来通知和标识负载均衡器中某个具体实例已经停止服务，不然负载均衡器在下一次获取服务实例清单前都会认为服务实例均是正常服务的。
+- getReachableServers：获取当前正常服务的实例列表。
+- getAllServers：获取所有已知的服务实例列表，包括正常服务和停止服务的实例。
+
+![](images/ribbon-code-2.png)
+而对于该接口的实现，我们可以整理出如上图所示的结构。我们可以看到BaseLoadBalancer类实现了基础的负载均衡，而DynamicServerListLoadBalancer和ZoneAwareLoadBalancer在负载均衡的策略上做了一些功能的扩展。
+通过RibbonClientConfiguration配置类，可以知道在整合时默认采用了ZoneAwareLoadBalancer来实现负载均衡器。
+```
+@Bean
+@ConditionalOnMissingBean
+public ILoadBalancer ribbonLoadBalancer(IClientConfig config,
+        ServerList<Server> serverList, ServerListFilter<Server> serverListFilter,
+        IRule rule, IPing ping) {
+    ZoneAwareLoadBalancer<Server> balancer = LoadBalancerBuilder.newBuilder()
+            .withClientConfig(config).withRule(rule).withPing(ping)
+            .withServerListFilter(serverListFilter).withDynamicServerList(serverList)
+            .buildDynamicServerListLoadBalancer();
+    return balancer;
+}
+```
+我们再回到RibbonLoadBalancerClient的execute函数逻辑，在通过ZoneAwareLoadBalancer的chooseServer函数获取了负载均衡策略分配到的服务实例对象Server之后，将其内容包装成RibbonServer对象（该对象除了存储了服务实例的信息之外，还增加了服务名serviceId、是否需要使用HTTPS等其他信息），然后使用该对象再回调LoadBalancerInterceptor请求拦截器中LoadBalancerRequest的apply(final ServiceInstance instance)函数，向一个实际的具体服务实例发起请求，从而实现一开始以服务名为host的URI请求，到实际访问host:post形式的具体地址的转换。
+
+分析到这里，我们已经可以大致理清Spring Cloud中使用Ribbon实现客户端负载均衡的基本脉络。了解了它是如何通过LoadBalancerInterceptor拦截器对RestTemplate的请求进行拦截，并利用Spring Cloud的负载均衡器LoadBalancerClient将以逻辑服务名为host的URI转换成具体的服务实例的过程。同时通过分析LoadBalancerClient的Ribbon实现RibbonLoadBalancerClient，可以知道在使用Ribbon实现负载均衡器的时候，实际使用的还是Ribbon中定义的ILoadBalancer接口的实现，自动化配置会采用ZoneAwareLoadBalancer的实例来进行客户端负载均衡实现。
+
+#### 负载均衡器
+通过之前的分析，我们已经对Spring Cloud如何使用Ribbon有了基本的了解。虽然Spring Cloud中定义了LoadBalancerClient为负载均衡器的接口，并且针对Ribbon实现了RibbonLoadBalancerClient，但是它在具体实现客户端负载均衡时，则是通过Ribbon的ILoadBalancer接口实现。在上一节分析时候，我们对该接口的实现结构已经做了一些简单的介绍，下面我们根据ILoadBalancer接口的实现类逐个看看它都是如何实现客户端负载均衡的。
+
+##### AbstractLoadBalancer
+AbstractLoadBalancer是ILoadBalancer接口的抽象实现。在该抽象类中定义了一个关于服务实例的分组枚举类ServerGroup，它包含了三种不同类型：ALL-所有服务实例、STATUS_UP-正常服务的实例、STATUS_NOT_UP-停止服务的实例；实现了一个chooseServer()函数，该函数通过调用接口中的chooseServer(Object key)实现，其中参数key为null，表示在选择具体服务实例时忽略key的条件判断；最后还定义了两个抽象函数，getServerList(ServerGroup serverGroup)定义了根据分组类型来获取不同的服务实例列表，getLoadBalancerStats()定义了获取LoadBalancerStats对象的方法，LoadBalancerStats对象被用来存储负载均衡器中各个服务实例当前的属性和统计信息，这些信息非常有用，我们可以利用这些信息来观察负载均衡器的运行情况，同时这些信息也是用来制定负载均衡策略的重要依据。
+```
+public abstract class AbstractLoadBalancer implements ILoadBalancer {
+
+    public enum ServerGroup{
+        ALL,
+        STATUS_UP,
+        STATUS_NOT_UP
+    }
+
+    public Server chooseServer() {
+        return chooseServer(null);
+    }
+
+    public abstract List<Server> getServerList(ServerGroup serverGroup);
+
+    public abstract LoadBalancerStats getLoadBalancerStats();
+}
+```
+##### BaseLoadBalancer
+BaseLoadBalancer类是Ribbon负载均衡器的基础实现类，在该类中定义很多关于均衡负载器相关的基础内容：
+- 定义并维护了两个存储服务实例Server对象的列表。一个用于存储所有服务实例的清单，一个用于存储正常服务的实例清单。
+```
+@Monitor(name = PREFIX + "AllServerList", type = DataSourceType.INFORMATIONAL)
+protected volatile List<Server> allServerList = Collections
+        .synchronizedList(new ArrayList<Server>());
+@Monitor(name = PREFIX + "UpServerList", type = DataSourceType.INFORMATIONAL)
+protected volatile List<Server> upServerList = Collections
+        .synchronizedList(new ArrayList<Server>());
+```
+- 定义了之前我们提到的用来存储负载均衡器各服务实例属性和统计信息的LoadBalancerStats对象。
+- 定义了检查服务实例是否正常服务的IPing对象，在BaseLoadBalancer中默认为null，需要在构造时注入它的具体实现。
+- 定义了检查服务实例操作的执行策略对象IPingStrategy，在BaseLoadBalancer中默认使用了该类中定义的静态内部类SerialPingStrategy实现。根据源码，我们可以看到该策略采用线性遍历ping服务实例的方式实现检查。该策略在当我们实现的IPing速度不理想，或是Server列表过大时，可能变的不是很为理想，这时候我们需要通过实现IPingStrategy接口并实现pingServers(IPing ping, Server[] servers)函数去扩展ping的执行策略。
+```
+private static class SerialPingStrategy implements IPingStrategy {
+    @Override
+    public boolean[] pingServers(IPing ping, Server[] servers) {
+        int numCandidates = servers.length;
+        boolean[] results = new boolean[numCandidates];
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("LoadBalancer:  PingTask executing ["
+                         + numCandidates + "] servers configured");
+        }
+
+        for (int i = 0; i < numCandidates; i++) {
+            results[i] = false;
+            try {
+                if (ping != null) {
+                    results[i] = ping.isAlive(servers[i]);
+                }
+            } catch (Throwable t) {
+                logger.error("Exception while pinging Server:"
+                             + servers[i], t);
+            }
+        }
+        return results;
+    }
+}
+```
+- 定义了负载均衡的处理规则IRule对象，从BaseLoadBalancer中chooseServer(Object key)的实现源码，我们可以知道负载均衡器实际进行服务实例选择任务是委托给了IRule实例中的choose函数来实现。而在这里，默认初始化了RoundRobinRule为IRule的实现对象。RoundRobinRule实现了最基本且常用的线性负载均衡规则。
+```
+public Server chooseServer(Object key) {
+    if (counter == null) {
+        counter = createCounter();
+    }
+    counter.increment();
+    if (rule == null) {
+        return null;
+    } else {
+        try {
+            return rule.choose(key);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+}
+```
+- 启动ping任务：在BaseLoadBalancer的默认构造函数中，会直接启动一个用于定时检查Server是否健康的任务。该任务默认的执行间隔为：10秒。
+- 实现了ILoadBalancer接口定义的负载均衡器应具备的一系列基本操作：
+    - addServers(List newServers)：向负载均衡器中增加新的服务实例列表，该实现将原本已经维护着的所有服务实例清单allServerList和新传入的服务实例清单newServers都加入到newList中，然后通过调用setServersList函数对newList进行处理，在BaseLoadBalancer中实现的时候会使用新的列表覆盖旧的列表。而之后介绍的几个扩展实现类对于服务实例清单更新的优化都是对setServersList函数的重写来实现的。
+    ```
+    public void addServers(List<Server> newServers) {
+        if (newServers != null && newServers.size() > 0) {
+            try {
+                ArrayList<Server> newList = new ArrayList<Server>();
+                newList.addAll(allServerList);
+                newList.addAll(newServers);
+                setServersList(newList);
+            } catch (Exception e) {
+                logger.error("Exception while adding Servers", e);
+            }
+        }
+    }
+    ```
+    - chooseServer(Object key)：挑选一个具体的服务实例，在上面介绍IRule的时候，已经做了说明，这里不再赘述。
+    - markServerDown(Server server)：标记某个服务实例暂停服务。
+    ```
+    public void markServerDown(Server server) {
+        if (server == null) {
+            return;
+        }
+        if (!server.isAlive()) {
+            return;
+        }
+        logger.error("LoadBalancer:  markServerDown called on ["
+                + server.getId() + "]");
+        server.setAlive(false);
+        notifyServerStatusChangeListener(singleton(server));
+    }
+    ```
+    - getReachableServers()：获取可用的服务实例列表。由于BaseLoadBalancer中单独维护了一个正常服务的实例清单，所以直接返回即可。
+    ```
+    public List<Server> getReachableServers() {
+        return Collections.unmodifiableList(upServerList);
+    }
+    ```
+    - getAllServers()：获取所有的服务实例列表。由于BaseLoadBalancer中单独维护了一个所有服务的实例清单，所以也直接返回它即可。
+    ```
+    public List<Server> getAllServers() {
+        return Collections.unmodifiableList(allServerList);
+    }
+    ```
+##### DynamicServerListLoadBalancer
+DynamicServerListLoadBalancer类继承于BaseLoadBalancer类，它是对基础负载均衡器的扩展。在该负载均衡器中，实现了服务实例清单的在运行期的动态更新能力；同时，它还具备了对服务实例清单的过滤功能，也就是说我们可以通过过滤器来选择性的获取一批服务实例清单。下面我们具体来看看在该类中增加了一些什么内容：
