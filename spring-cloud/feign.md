@@ -1,4 +1,13 @@
 ### 深入理解Feign
+Feign是一个声明式的Web Service客户端，它的目的就是让Web Service调用更加简单。它整合了Ribbon和Hystrix，从而让我们不再需要显式地使用这两个组件。Feign还提供了HTTP请求的模板，通过编写简单的接口和插入注解，我们就可以定义好HTTP请求的参数、格式、地址等信息。接下来，Feign会完全代理HTTP的请求，我们只需要像调用方法一样调用它就可以完成服务请求。
+
+#### Feign具有如下特性：
+- 可插拔的注解支持，包括Feign注解和JAX-RS注解
+- 支持可插拔的HTTP编码器和解码器
+- 支持Hystrix和它的Fallback
+- 支持Ribbon的负载均衡
+- 支持HTTP请求和响应的压缩
+
 #### Feign的源码实现的过程如下：
     1. 首先通过@EnableFeignCleints注解开启FeignCleint
     2. 根据Feign的规则实现接口，并加@FeignCleint注解

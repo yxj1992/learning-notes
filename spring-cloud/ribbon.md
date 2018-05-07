@@ -300,3 +300,94 @@ public Server chooseServer(Object key) {
     ```
 ##### DynamicServerListLoadBalancer
 DynamicServerListLoadBalancer类继承于BaseLoadBalancer类，它是对基础负载均衡器的扩展。在该负载均衡器中，实现了服务实例清单的在运行期的动态更新能力；同时，它还具备了对服务实例清单的过滤功能，也就是说我们可以通过过滤器来选择性的获取一批服务实例清单。下面我们具体来看看在该类中增加了一些什么内容：
+
+##### ZoneAwareLoadBalancer
+ZoneAwareLoadBalancer负载均衡器是对DynamicServerListLoadBalancer的扩展。在DynamicServerListLoadBalancer中，我们可以看到它并没有重写选择具体服务实例的chooseServer函数，所以它依然会采用在BaseLoadBalancer中实现的算法，使用RoundRobinRule规则，以线性轮询的方式来选择调用的服务实例，该算法实现简单并没有区域（Zone）的概念，所以它会把所有实例视为一个Zone下的节点来看待，这样就会周期性的产生跨区域（Zone）访问的情况，由于跨区域会产生更高的延迟，这些实例主要以防止区域性故障实现高可用为目的而不能作为常规访问的实例，所以在多区域部署的情况下会有一定的性能问题，而该负载均衡器则可以避免这样的问题。那么它是如何实现的呢？
+
+首先，在ZoneAwareLoadBalancer中，我们可以发现，它并没有重写setServersList，说明实现服务实例清单的更新主逻辑没有修改。但是我们可以发现它重写了这个函数：setServerListForZones(Map<String, List<Server>> zoneServersMap)。看到这里可能会有一些陌生，因为它并不是接口中定义的必备函数，所以我们不妨去父类DynamicServerListLoadBalancer中寻找一下该函数，我们可以找到下面的定义了：
+```
+public void setServersList(List lsrv) {
+    super.setServersList(lsrv);
+    List<T> serverList = (List<T>) lsrv;
+    Map<String, List<Server>> serversInZones = new HashMap<String, List<Server>>();
+    ...
+    setServerListForZones(serversInZones);
+}
+
+protected void setServerListForZones(Map<String, List<Server>> zoneServersMap) {
+    LOGGER.debug("Setting server list for zones: {}", zoneServersMap);
+    getLoadBalancerStats().updateZoneServerMapping(zoneServersMap);
+}
+```
+setServerListForZones函数的调用位于更新服务实例清单函数setServersList的最后，同时从其实现内容来看，它在父类DynamicServerListLoadBalancer中的作用是根据按区域Zone分组的实例列表，为负载均衡器中的LoadBalancerStats对象创建ZoneStats并放入Map zoneStatsMap集合中，每一个区域Zone会对应一个ZoneStats，它用于存储每个Zone的一些状态和统计信息。
+在ZoneAwareLoadBalancer中对setServerListForZones的重写如下：
+```
+protected void setServerListForZones(Map<String, List<Server>> zoneServersMap) {
+    super.setServerListForZones(zoneServersMap);
+    if (balancers == null) {
+        balancers = new ConcurrentHashMap<String, BaseLoadBalancer>();
+    }
+    for (Map.Entry<String, List<Server>> entry: zoneServersMap.entrySet()) {
+        String zone = entry.getKey().toLowerCase();
+        getLoadBalancer(zone).setServersList(entry.getValue());
+    }
+    for (Map.Entry<String, BaseLoadBalancer> existingLBEntry: balancers.entrySet()) {
+        if (!zoneServersMap.keySet().contains(existingLBEntry.getKey())) {
+            existingLBEntry.getValue().setServersList(Collections.emptyList());
+        }
+    }
+}
+```
+可以看到，在该实现中创建了一个ConcurrentHashMap()类型的balancers对象，它将用来存储每个Zone区域对应的负载均衡器，而具体的负载均衡器的创建则是通过下面的第一个循环中调用getLoadBalancer函数来完成，同时在创建负载均衡器的时候会创建它的规则（如果当前实现中没有IRULE的实例，就创建一个AvailabilityFilteringRule规则；如果已经有具体实例，就clone一个），在创建完负载均衡器后又马上调用setServersList函数为其设置对应Zone区域的实例清单。而第二个循环则是对Zone区域中实例清单的检查，看看是否有Zone区域下已经没有实例了，是的话就将balancers中对应Zone区域的实例列表清空，该操作的作用是为了后续选择节点时，防止过时的Zone区域统计信息干扰具体实例的选择算法。
+在了解了该负载均衡器是如何扩展服务实例清单的实现后，我们来具体看看它是如何挑选服务实例，来实现对区域的识别的：
+```
+public Server chooseServer(Object key) {
+    if (!ENABLED.get() || getLoadBalancerStats().getAvailableZones().size() <= 1) {
+        logger.debug("Zone aware logic disabled or there is only one zone");
+        return super.chooseServer(key);
+    }
+    Server server = null;
+    try {
+        LoadBalancerStats lbStats = getLoadBalancerStats();
+        Map<String, ZoneSnapshot> zoneSnapshot = ZoneAvoidanceRule.createSnapshot(lbStats);
+        logger.debug("Zone snapshots: {}", zoneSnapshot);
+        ...
+        Set<String> availableZones = ZoneAvoidanceRule.getAvailableZones(zoneSnapshot, triggeringLoad.get(), triggeringBlackoutPercentage.get());
+        logger.debug("Available zones: {}", availableZones);
+        if (availableZones != null &&  availableZones.size() < zoneSnapshot.keySet().size()) {
+            String zone = ZoneAvoidanceRule.randomChooseZone(zoneSnapshot, availableZones);
+            logger.debug("Zone chosen: {}", zone);
+            if (zone != null) {
+                BaseLoadBalancer zoneLoadBalancer = getLoadBalancer(zone);
+                server = zoneLoadBalancer.chooseServer(key);
+            }
+        }
+    } catch (Throwable e) {
+        logger.error("Unexpected exception when choosing server using zone aware logic", e);
+    }
+    if (server != null) {
+        return server;
+    } else {
+        logger.debug("Zone avoidance logic is not invoked.");
+        return super.chooseServer(key);
+    }
+}
+```
+从源码中我们可以看到，只有当负载均衡器中维护的实例所属Zone区域个数大于1的时候才会执行这里的选择策略，否则还是将使用父类的实现。当Zone区域个数大于1个的时候，它的实现步骤主要如下：
+
+- 调用ZoneAvoidanceRule中的静态方法createSnapshot(lbStats)，为当前负载均衡器中所有的Zone区域分别创建快照，保存在Map zoneSnapshot中，这些快照中的数据将用于后续的算法。
+- 调用ZoneAvoidanceRule中的静态方法getAvailableZones(zoneSnapshot, triggeringLoad.get(), triggeringBlackoutPercentage.get())，来获取可用的Zone区域集合，在该函数中会通过Zone区域快照中的统计数据来实现可用区的挑选。
+    - 首先它会剔除符合这些规则的Zone区域：所属实例数为零的Zone区域；Zone区域内实例平均负载小于零，或者实例故障率（断路器断开次数/实例数）大于等于阈值（默认为0.99999）。
+    - 然后根据Zone区域的实例平均负载来计算出最差的Zone区域，这里的最差指的是实例平均负载最高的Zone区域。
+    - 如果在上面的过程中没有符合剔除要求的区域，同时实例最大平均负载小于阈值（默认为20%），就直接返回所有Zone区域为可用区域。否则，从最坏Zone区域集合中随机的选择一个，将它从可用Zone区域集合中剔除。
+- 当获得的可用Zone区域集合不为空，并且个数小于Zone区域总数，就随机的选择一个Zone区域。
+- 在确定了某个Zone区域后，则获取对应Zone区域的服务均衡器，并调用chooseServer来选择具体的服务实例，而在chooseServer中将使用IRule接口的choose函数来选择具体的服务实例。在这里IRule接口的实现会使用ZoneAvoidanceRule来挑选出具体的服务实例。
+
+#### 负载均衡策略
+![](images/ribbon-code-5.png)
+
+#### Ribbon工作时会做四件事情：
+ 1. 优先选择在同一个Zone且负载较少的Eureka Server；
+ 2. 定期从Eureka更新并过滤服务实例列表；
+ 3. 根据用户指定的策略，在从Server取到的服务注册列表中选择一个实例的地址；
+ 4. 通过RestClient进行服务调用。
